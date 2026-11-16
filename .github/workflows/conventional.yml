@@ -1,0 +1,91 @@
+name: Conventional
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conventional-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  BOOTSTRAP_COMMIT: ce8cd4736598bd411df139e8723b46d570d9dfd0
+  GH_NO_UPDATE_NOTIFIER: "1"
+
+jobs:
+  check:
+    name: conventional / check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: cocogitto/cocogitto-action@9a9fe03b31c47444290c0d7f9b1ee1b44ee13f20 # v4.1.0
+        with:
+          command: --version
+      - name: Verify every commit after the authorized README bootstrap
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$BOOTSTRAP_COMMIT" HEAD
+          commits=$(git rev-list --reverse "$BOOTSTRAP_COMMIT..HEAD")
+          for commit in $commits; do
+            cog verify "$(git show -s --format=%B "$commit")"
+          done
+      - name: Calculate the native semantic version
+        id: version
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          version: v2.14.2
+          args: --offline --no-exec --bump=auto ${{ env.BOOTSTRAP_COMMIT }}..HEAD
+        env:
+          OUTPUT: ${{ runner.temp }}/site-version-metadata.md
+
+  release:
+    if: github.event_name == 'push'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Publish the reviewed merge and its PR descriptions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_TAG"
+          previous_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=1" --jq '.[0].tag_name // ""')
+          release_base=${previous_tag:-$BOOTSTRAP_COMMIT}
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          pulls_file="$RUNNER_TEMP/release-prs.txt"
+          trap 'rm -f "$notes_file" "$pulls_file"' EXIT
+          : > "$notes_file"
+          : > "$pulls_file"
+          commits=$(git rev-list --reverse "$release_base..$GITHUB_SHA")
+          for commit in $commits; do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$commit/pulls" \
+              --jq '.[] | select(.merged_at != null) | .number' >> "$pulls_file"
+          done
+          sort -nu "$pulls_file" -o "$pulls_file"
+          test -s "$pulls_file"
+          first=true
+          while IFS= read -r pull; do
+            if [ "$first" = false ]; then printf '\n\n' >> "$notes_file"; fi
+            gh pr view "$pull" --repo "$GITHUB_REPOSITORY" --json body --jq .body >> "$notes_file"
+            first=false
+          done < "$pulls_file"
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file "$notes_file"
