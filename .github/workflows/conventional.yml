@@ -85,7 +85,7 @@ jobs:
           first=true
           while IFS= read -r pull; do
             if [ "$first" = false ]; then printf '\n\n' >> "$notes_file"; fi
-            gh pr view "$pull" --repo "$GITHUB_REPOSITORY" --json body --jq .body >> "$notes_file"
+            gh pr view "$pull" --repo "$GITHUB_REPOSITORY" --json body | jq -j .body >> "$notes_file"
             first=false
           done < "$pulls_file"
           gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file "$notes_file"
